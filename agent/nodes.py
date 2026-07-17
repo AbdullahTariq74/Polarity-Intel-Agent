@@ -7,9 +7,11 @@ from agent.memory import log_decision, save_result
 from agent.observability import AgentObserver
 from agent.state import AgentState
 from agent.tools import web_search
+from models.report import IntelligenceReport
 from models.result import ClassificationLabel, ClassifiedResult
 from prompts.classify import CLASSIFY_PROMPT
 from prompts.decompose import DECOMPOSE_PROMPT, DECOMPOSE_SYSTEM
+from prompts.synthesize import SYNTHESIZE_PROMPT
 from prompts.validate import VALIDATE_PROMPT
 
 HUMAN_CHOICE_LABELS = {
@@ -260,3 +262,95 @@ def human_validation_checkpoint(state: AgentState) -> AgentState:
         "human_validation_required": False,
         "decision_trace": state["decision_trace"] + observer.get_trace()
     }
+
+
+def _format_matches(results) -> str:
+    if not results:
+        return "(none)"
+    return "\n".join(
+        f"- {r.entity_name or r.title} | {r.url} | Signals: {', '.join(r.mandate_signals or [])}"
+        for r in results
+    )
+
+
+def synthesize_report(state: AgentState) -> AgentState:
+    """
+    Node 5: Synthesize every classified result into a final intelligence
+    report. Combines the model's narrative synthesis with the full
+    decision trace so the report is both readable and fully auditable.
+    """
+    observer = AgentObserver(state["session_id"])
+    mandate = state["mandate"]
+
+    strong = [r for r in state["classified_results"] if r.classification == ClassificationLabel.STRONG_MATCH]
+    weak = [r for r in state["classified_results"] if r.classification == ClassificationLabel.WEAK_MATCH]
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": SYNTHESIZE_PROMPT.format(
+                    mandate=mandate.raw_input,
+                    strong_count=len(strong),
+                    strong_matches=_format_matches(strong),
+                    weak_count=len(weak),
+                    weak_matches=_format_matches(weak)
+                )
+            }]
+        )
+        data = _extract_json(response.content[0].text)
+
+        report = IntelligenceReport(
+            mandate_summary=mandate.raw_input,
+            session_id=state["session_id"],
+            total_searches_performed=state["iterations_used"],
+            total_results_evaluated=len(state["classified_results"]),
+            strong_matches=strong,
+            weak_matches=weak,
+            flagged_for_review=state.get("ambiguous_items_pending", []),
+            synthesis=data["synthesis"],
+            recommended_actions=data.get("recommended_actions", []),
+            cost_ceiling_hit=state["cost_ceiling_hit"],
+            agent_decisions_log=state["decision_trace"],
+            errors_encountered=state["errors"]
+        )
+
+        observer.log_decision(
+            node="synthesize_report",
+            decision="Report generated",
+            reasoning=f"Found {len(strong)} strong matches and {len(weak)} weak matches"
+        )
+
+        return {
+            **state,
+            "report": report,
+            "decision_trace": state["decision_trace"] + observer.get_trace()
+        }
+
+    except Exception as exc:
+        observer.log_failure("synthesize_report", str(exc), "Returning partial report with fallback synthesis")
+
+        report = IntelligenceReport(
+            mandate_summary=mandate.raw_input,
+            session_id=state["session_id"],
+            total_searches_performed=state["iterations_used"],
+            total_results_evaluated=len(state["classified_results"]),
+            strong_matches=strong,
+            weak_matches=weak,
+            flagged_for_review=state.get("ambiguous_items_pending", []),
+            synthesis="Synthesis unavailable due to an error. Raw classified results are attached below.",
+            recommended_actions=[],
+            cost_ceiling_hit=state["cost_ceiling_hit"],
+            agent_decisions_log=state["decision_trace"],
+            errors_encountered=state["errors"] + [str(exc)]
+        )
+
+        return {
+            **state,
+            "report": report,
+            "errors": state["errors"] + [str(exc)],
+            "decision_trace": state["decision_trace"] + observer.get_trace()
+        }
