@@ -6,6 +6,7 @@ from anthropic import Anthropic
 from agent.memory import log_decision
 from agent.observability import AgentObserver
 from agent.state import AgentState
+from agent.tools import web_search
 from prompts.decompose import DECOMPOSE_PROMPT, DECOMPOSE_SYSTEM
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -82,3 +83,43 @@ def decompose_mandate(state: AgentState) -> AgentState:
             "errors": state["errors"] + [str(exc)],
             "decision_trace": state["decision_trace"] + observer.get_trace()
         }
+
+
+def execute_searches(state: AgentState) -> AgentState:
+    """
+    Node 2: Execute a web search for each decomposed query.
+    Enforces the mandate's cost ceiling - once max_search_iterations is
+    reached, remaining queries are skipped and cost_ceiling_hit is set.
+    """
+    observer = AgentObserver(state["session_id"])
+    mandate = state["mandate"]
+    all_results = []
+    iterations = 0
+    ceiling_hit = False
+
+    for query in state["search_queries"]:
+        if iterations >= mandate.max_search_iterations:
+            observer.log_ceiling_hit("search_iterations", iterations, mandate.max_search_iterations)
+            ceiling_hit = True
+            break
+
+        results = web_search(query, max_results=mandate.max_results_per_query)
+        for result in results:
+            result["source_query"] = query
+        all_results.extend(results)
+        iterations += 1
+
+        observer.log_tool_call(
+            tool_name="web_search",
+            inputs={"query": query, "max_results": mandate.max_results_per_query},
+            result_summary=f"Returned {len(results)} results",
+            success=len(results) > 0
+        )
+
+    return {
+        **state,
+        "raw_results": all_results,
+        "iterations_used": iterations,
+        "cost_ceiling_hit": ceiling_hit,
+        "decision_trace": state["decision_trace"] + observer.get_trace()
+    }
