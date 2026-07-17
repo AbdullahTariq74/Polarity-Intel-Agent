@@ -116,7 +116,12 @@ def execute_searches(state: AgentState) -> AgentState:
             ceiling_hit = True
             break
 
-        results = web_search(query, max_results=mandate.max_results_per_query)
+        try:
+            results = web_search(query, max_results=mandate.max_results_per_query)
+        except Exception as exc:
+            observer.log_failure("execute_searches", str(exc), f"Skipping query '{query}'")
+            results = []
+
         for result in results:
             result["source_query"] = query
         all_results.extend(results)
@@ -235,7 +240,15 @@ def human_validation_checkpoint(state: AgentState) -> AgentState:
             confidence=item.confidence_score
         )
         print(f"\n{prompt_text}")
-        choice = input("> ").strip()
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            observer.log_failure(
+                "human_validation_checkpoint",
+                "No interactive input available",
+                "Leaving item unresolved and excluding it from the report"
+            )
+            continue
 
         if choice in HUMAN_CHOICE_LABELS:
             item.classification = HUMAN_CHOICE_LABELS[choice]
