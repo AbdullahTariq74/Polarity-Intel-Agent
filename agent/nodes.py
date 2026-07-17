@@ -10,6 +10,13 @@ from agent.tools import web_search
 from models.result import ClassificationLabel, ClassifiedResult
 from prompts.classify import CLASSIFY_PROMPT
 from prompts.decompose import DECOMPOSE_PROMPT, DECOMPOSE_SYSTEM
+from prompts.validate import VALIDATE_PROMPT
+
+HUMAN_CHOICE_LABELS = {
+    "1": ClassificationLabel.STRONG_MATCH,
+    "2": ClassificationLabel.WEAK_MATCH,
+    "3": ClassificationLabel.IRRELEVANT,
+}
 
 CONTENT_CHAR_LIMIT = 2000
 
@@ -204,5 +211,52 @@ def classify_results(state: AgentState) -> AgentState:
         "classified_results": classified,
         "ambiguous_items_pending": ambiguous,
         "human_validation_required": len(ambiguous) > 0,
+        "decision_trace": state["decision_trace"] + observer.get_trace()
+    }
+
+
+def human_validation_checkpoint(state: AgentState) -> AgentState:
+    """
+    Node 4: Surface every AMBIGUOUS result to a human reviewer instead of
+    guessing. Runs interactively on the CLI; the Streamlit UI surfaces the
+    same ambiguous_items_pending list in its own review panel.
+    """
+    observer = AgentObserver(state["session_id"])
+    resolved = []
+
+    for item in state["ambiguous_items_pending"]:
+        prompt_text = VALIDATE_PROMPT.format(
+            entity_name=item.entity_name or item.title,
+            url=item.url,
+            content_summary=item.raw_content[:300],
+            reasoning=item.reasoning,
+            confidence=item.confidence_score
+        )
+        print(f"\n{prompt_text}")
+        choice = input("> ").strip()
+
+        if choice in HUMAN_CHOICE_LABELS:
+            item.classification = HUMAN_CHOICE_LABELS[choice]
+            item.requires_human_review = False
+            resolved.append(item)
+            observer.log_decision(
+                node="human_validation_checkpoint",
+                decision=f"Human classified as {item.classification.value}",
+                reasoning="Resolved via human validation checkpoint",
+                metadata={"url": item.url}
+            )
+        else:
+            observer.log_decision(
+                node="human_validation_checkpoint",
+                decision="Skipped by human reviewer",
+                reasoning="Reviewer chose to exclude this item from the report",
+                metadata={"url": item.url}
+            )
+
+    return {
+        **state,
+        "classified_results": state["classified_results"] + resolved,
+        "ambiguous_items_pending": [],
+        "human_validation_required": False,
         "decision_trace": state["decision_trace"] + observer.get_trace()
     }
