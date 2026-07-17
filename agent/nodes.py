@@ -3,11 +3,15 @@ from typing import Any, Dict, Optional
 
 from anthropic import Anthropic
 
-from agent.memory import log_decision
+from agent.memory import log_decision, save_result
 from agent.observability import AgentObserver
 from agent.state import AgentState
 from agent.tools import web_search
+from models.result import ClassificationLabel, ClassifiedResult
+from prompts.classify import CLASSIFY_PROMPT
 from prompts.decompose import DECOMPOSE_PROMPT, DECOMPOSE_SYSTEM
+
+CONTENT_CHAR_LIMIT = 2000
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
@@ -121,5 +125,84 @@ def execute_searches(state: AgentState) -> AgentState:
         "raw_results": all_results,
         "iterations_used": iterations,
         "cost_ceiling_hit": ceiling_hit,
+        "decision_trace": state["decision_trace"] + observer.get_trace()
+    }
+
+
+def classify_results(state: AgentState) -> AgentState:
+    """
+    Node 3: Classify each raw search result against the mandate.
+    The model chooses exactly one of four bounded labels per result.
+    AMBIGUOUS results are routed to ambiguous_items_pending for the
+    human validation checkpoint rather than being guessed at.
+    """
+    observer = AgentObserver(state["session_id"])
+    mandate = state["mandate"]
+    client = _get_client()
+
+    classified = []
+    ambiguous = []
+
+    for result in state["raw_results"]:
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                messages=[{
+                    "role": "user",
+                    "content": CLASSIFY_PROMPT.format(
+                        mandate=mandate.raw_input,
+                        title=result.get("title", ""),
+                        url=result.get("url", ""),
+                        content=result.get("content", "")[:CONTENT_CHAR_LIMIT]
+                    )
+                }]
+            )
+            data = _extract_json(response.content[0].text)
+
+            classified_result = ClassifiedResult(
+                url=result.get("url", ""),
+                title=result.get("title", ""),
+                raw_content=result.get("content", ""),
+                classification=ClassificationLabel(data["classification"]),
+                confidence_score=data["confidence_score"],
+                reasoning=data["reasoning"],
+                entity_name=data.get("entity_name"),
+                mandate_signals=data.get("mandate_signals", []),
+                contact_hints=data.get("contact_hints", []),
+                requires_human_review=data.get("requires_human_review", False),
+                source_query=result.get("source_query")
+            )
+
+            observer.log_decision(
+                node="classify_results",
+                decision=f"Classified as {classified_result.classification.value}",
+                reasoning=classified_result.reasoning,
+                metadata={"url": classified_result.url, "confidence": classified_result.confidence_score}
+            )
+            save_result(
+                state["session_id"],
+                classified_result.source_query or "",
+                classified_result.url,
+                classified_result.title,
+                classified_result.classification.value,
+                classified_result.confidence_score,
+                classified_result.reasoning
+            )
+
+            if classified_result.classification == ClassificationLabel.AMBIGUOUS:
+                ambiguous.append(classified_result)
+            else:
+                classified.append(classified_result)
+
+        except Exception as exc:
+            observer.log_failure("classify_results", str(exc), "Skipping unparsable result")
+            continue
+
+    return {
+        **state,
+        "classified_results": classified,
+        "ambiguous_items_pending": ambiguous,
+        "human_validation_required": len(ambiguous) > 0,
         "decision_trace": state["decision_trace"] + observer.get_trace()
     }
